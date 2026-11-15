@@ -58,6 +58,16 @@ class Sm120CakeMegaMoeConfigBase:
     situ_beta: float | None = None
     situ_linear_beta: float | None = None
     return_codec: str = "bf16"
+    # Experimental (local only): launch the device closure of
+    # ``kernel_src/sm120/cake_mxfp4_megamoe_ks`` (generated from the merged seed param/pd-dyn: kernsched
+    # P1 expert task order below R2048, P3 parallel end-of-epoch audit, E3b fast return service; same
+    # activation / return codecs as the default closure, plus the MOE_DYN_EPLB parameter).
+    kernel_sched: bool = False
+    # Experimental (dynamic EPLB, needs ``kernel_sched=True``): build the switch-on kernel that
+    # re-splits the routes of replicated experts per call (in-kernel count exchange, planner and
+    # replica map).  The placement comes from ``set_dyn_placement``; without one the kernel keeps
+    # the input ids.  EP world sizes 4, 8 and 16.
+    dynamic_eplb: bool = False
 
     def activation_parameters(self) -> tuple[int, int, int]:
         """``(MOE_ACTIVATION, MOE_ACT_P0, MOE_ACT_P1)`` of the device build; validates the activation fields."""
@@ -135,6 +145,13 @@ class Sm120CakeMegaMoeConfigBase:
         if self.return_codec not in RETURN_CODECS:
             raise ValueError(
                 f"return_codec must be one of {sorted(RETURN_CODECS)}, got {self.return_codec!r}"
+            )
+        for name in ("kernel_sched", "dynamic_eplb"):
+            if not isinstance(getattr(self, name), bool):
+                raise ValueError(f"{name} must be a bool, got {getattr(self, name)!r}")
+        if self.dynamic_eplb and not self.kernel_sched:
+            raise ValueError(
+                "dynamic_eplb=True needs kernel_sched=True (only the kernel_sched closure has MOE_DYN_EPLB)"
             )
         if self.shared_expert not in (None, SHARED_EXPERT_FP8_IN_KERNEL):
             raise ValueError(

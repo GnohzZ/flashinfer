@@ -392,6 +392,13 @@ def scratch_specs(
         ("epoch_state", 1),
     ):
         specs.append((name, u32, (size,), _FILL_ZERO))
+    if "DYN_SCRATCH_BYTES" in C:
+        # Dynamic-EPLB build (kernel_sched closure, MOE_DYN_EPLB=1): placement blob (written by
+        # ``set_dyn_placement`` / ``load_dyn_placement``; all-zero = no placement, the kernel keeps
+        # the input ids), per-call scratch and diagnostic counters.
+        specs.append(("dyn_placement", i32, (C["DYN_BLOB_WORDS"],), _FILL_ZERO))
+        specs.append(("dyn_scratch", i32, (C["DYN_SCRATCH_BYTES"] // 4,), _FILL_ZERO))
+        specs.append(("dyn_stats", u32, (C.get("DYN_STATS_WORDS", 16),), _FILL_ZERO))
     return specs
 
 
@@ -468,13 +475,13 @@ def check_device_resources(
 
     from concurrent.futures import ThreadPoolExecutor
 
-    from ......kernel_src.sm120.cake_mxfp4_megamoe import (
-        GIN_BACKENDS,
-        cuobjdump_path,
-        device_cubin_resource_usage,
-        nvcc_version,
-    )
-    from .cake_geometry import INSTANCE_NAMES
+    from .cake_geometry import INSTANCE_NAMES, kernel_package
+
+    package = kernel_package(params.kernel_sched)
+    GIN_BACKENDS = package.GIN_BACKENDS
+    cuobjdump_path = package.cuobjdump_path
+    device_cubin_resource_usage = package.device_cubin_resource_usage
+    nvcc_version = package.nvcc_version
 
     if resource_usage is None:
         if cuobjdump_path() is None:
@@ -722,6 +729,8 @@ class _CakeWorkspace:
     last_launch: dict[str, Any] = field(default_factory=dict)
     layers: dict[int, _LayerDescriptors] = field(default_factory=dict)
     destroyed: bool = False
+    # Dynamic EPLB: count transport agreed by the first set_dyn_placement (None = not yet).
+    dyn_count_lsa: list[int] | None = None
 
     @property
     def output(self) -> torch.Tensor:
@@ -808,6 +817,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             act_p1=act_p1,
             return_codec=RETURN_CODECS[config.return_codec],
             act_codec=self.ACT_CODEC,
+            kernel_sched=bool(config.kernel_sched),
+            dyn_eplb=int(bool(config.dynamic_eplb)),
         )
 
     def _describe(
@@ -926,6 +937,8 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             config.return_codec,
             config.variant,
             config.transport_table,
+            bool(config.kernel_sched),
+            bool(config.dynamic_eplb),
             knobs_pool_key(config.knobs),
         )
 
@@ -1013,10 +1026,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
     def _allocate_workspace(self, fleet_params: FleetParams) -> _CakeWorkspace:
         import torch.distributed as dist
 
-        from ......kernel_src.sm120.cake_mxfp4_megamoe import (
-            device_cubin,
-            load_cake_sm120_megamoe_module,
-        )
+        from .cake_geometry import kernel_package
+
+        package = kernel_package(bool(self._kernel_config.kernel_sched))
+        device_cubin = package.device_cubin
+        load_cake_sm120_megamoe_module = package.load_cake_sm120_megamoe_module
 
         group = self.ep_comm_group
         rank, world_size = self.ep_rank, self.ep_world_size
@@ -1202,9 +1216,9 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
         device_parameters = kernel["params"].device_parameters()
         gin_backend = _NO_GIN_BACKEND
         if session.gin_available:
-            from ......kernel_src.sm120.cake_mxfp4_megamoe import gin_backend_name
+            from .cake_geometry import kernel_package
 
-            gin_backend = gin_backend_name(session.gin_type)
+            gin_backend = kernel_package(kernel["params"].kernel_sched).gin_backend_name(session.gin_type)
         for inst_name, spec in specs.items():
             cubin = device_cubin(device_parameters, int(spec["instance"]), gin_backend)
             function = int(
@@ -1217,11 +1231,12 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             loaded_functions.append(function)
             local_bytes = int(module.function_local_bytes(function))
             if local_bytes > LOCAL_BYTES_LIMIT:
-                from ......kernel_src.sm120.cake_mxfp4_megamoe import (
-                    cuobjdump_path,
-                    device_cubin_resource_usage,
-                    nvcc_version,
-                )
+                from .cake_geometry import kernel_package
+
+                _pkg = kernel_package(kernel["params"].kernel_sched)
+                cuobjdump_path = _pkg.cuobjdump_path
+                device_cubin_resource_usage = _pkg.device_cubin_resource_usage
+                nvcc_version = _pkg.nvcc_version
 
                 detail = f" (limit {LOCAL_BYTES_LIMIT} B) with nvcc {nvcc_version()}"
                 if cuobjdump_path() is not None:  # registers, stack and local apart
@@ -1738,6 +1753,120 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             output[:rows].copy_(out)
             return output[:rows]
         return out
+
+    def set_dyn_placement(
+        self,
+        workspace: Any,
+        physical_to_logical: list[int],
+        *,
+        logical_experts: int,
+        min_rows: int | None = None,
+        wait_ns: int = 50_000,
+        affinity: bool | int | None = None,
+        early_ctas: int | None = None,
+    ) -> None:
+        """Dynamic EPLB (``dynamic_eplb=True`` builds): install this deployment's replica placement.
+
+        Every rank must pass the same placement.  The kernel then re-splits, per call and inside the
+        kernel, the routes of replicated experts (count exchange, planner, replica map); calls below
+        ``min_rows`` collective rows keep the input ids.  ``affinity``: owner-affinity map, bool or from this many
+        collective rows on.  ``early_ctas``: protocol CTAs with the fused shared expert (the rest stream the shared
+        tiles under the dyn prologue; 0 = off).  ``None`` = the measured defaults (``cake_dyneplb.dyn_eplb_defaults``).  Install once per
+        placement, not per call (the install is a blocking host-to-device copy).  Collective: agrees the count
+        transport.
+        """
+
+        ws = self._live(workspace)
+        blob = self.dyn_placement_words(
+            ws,
+            physical_to_logical,
+            logical_experts=logical_experts,
+            min_rows=min_rows,
+            wait_ns=wait_ns,
+            affinity=affinity,
+            early_ctas=early_ctas,
+        )
+        ws.storage["dyn_placement"].view(torch.int32).copy_(
+            torch.tensor(blob, dtype=torch.int32), non_blocking=False
+        )
+
+    def dyn_placement_words(
+        self,
+        workspace: Any,
+        physical_to_logical: list[int],
+        *,
+        logical_experts: int,
+        min_rows: int | None = None,
+        wait_ns: int = 50_000,
+        affinity: bool | int | None = None,
+        early_ctas: int | None = None,
+    ) -> list[int]:
+        """The ``dyn_placement`` blob of a placement (host int32 words) without installing it.
+
+        For workspaces shared by layers with different placements: build every layer's blob once, keep them on the
+        device and install one before each call with :meth:`load_dyn_placement`.  Collective on the first call per
+        workspace (agrees the count transport), host-only afterwards; arguments as :meth:`set_dyn_placement`.
+        """
+
+        import torch.distributed as dist
+
+        from .cake_dyneplb import dyn_eplb_defaults, dyn_placement_blob
+
+        ws = self._live(workspace)
+        defaults = dyn_eplb_defaults(ws.world_size)
+        min_rows = defaults["min_rows"] if min_rows is None else min_rows
+        affinity = defaults["affinity"] if affinity is None else affinity
+        early_ctas = defaults["early_ctas"] if early_ctas is None else early_ctas
+        if "dyn_placement" not in ws.storage:
+            raise MoEEpConfigError(f"{KERNEL_NAME}: set_dyn_placement needs dynamic_eplb=True")
+        C = ws.instances["m128"].constants
+        count_lsa = ws.dyn_count_lsa
+        if count_lsa is None:
+            # Collective once per workspace: per rank r, the peers q whose pair (r, q) is LSA-reachable both ways
+            # (self always) carry the count rows over LSA, the others over GIN.
+            W = ws.world_size
+            mine = torch.tensor(
+                [int(bool(v)) for v in ws.session.lsa_reachable][:W], dtype=torch.int32, device=ws.device
+            )
+            rows = [torch.zeros_like(mine) for _ in range(W)]
+            dist.all_gather(rows, mine, group=ws.group)
+            m = [r.cpu().tolist() for r in rows]
+            count_lsa = [sum(1 << q for q in range(W) if q == r or (m[r][q] and m[q][r])) for r in range(W)]
+            ws.dyn_count_lsa = count_lsa
+        return dyn_placement_blob(
+            C,
+            [int(v) for v in physical_to_logical],
+            logical_experts=logical_experts,
+            world_size=ws.world_size,
+            min_rows=min_rows,
+            wait_ns=wait_ns,
+            count_lsa=count_lsa,
+            affinity=affinity,
+            early_ctas=early_ctas,
+        )
+
+    def load_dyn_placement(self, workspace: Any, blob: torch.Tensor) -> None:
+        """Install a blob from :meth:`dyn_placement_words` held on the device: a copy on the current stream, ordered
+        before the next launch (no host synchronization, capturable).  Every rank must load the same placement."""
+
+        ws = self._live(workspace)
+        dst = ws.storage["dyn_placement"].view(torch.int32) if "dyn_placement" in ws.storage else None
+        if dst is None:
+            raise MoEEpConfigError(f"{KERNEL_NAME}: load_dyn_placement needs dynamic_eplb=True")
+        if blob.dtype != torch.int32 or blob.device != dst.device or blob.numel() != dst.numel():
+            raise MoEEpConfigError(
+                f"{KERNEL_NAME}: load_dyn_placement needs an int32 tensor of {dst.numel()} words on {dst.device}"
+            )
+        dst.copy_(blob.view(-1), non_blocking=True)
+
+    def dyn_stats(self, workspace: Any) -> list[int]:
+        """Dynamic-EPLB diagnostic counters (cumulative): epochs, gated, blob mismatch, CTA deadline, CTA bad row,
+        rank fallback, bad route, plans, max planner iterations, cap hit, map miss."""
+
+        ws = self._live(workspace)
+        if "dyn_stats" not in ws.storage:
+            return []
+        return [int(v) for v in ws.storage["dyn_stats"].view(torch.int32).cpu().tolist()]
 
     def device_epoch(self, workspace: Any) -> int:
         """Synchronous read of the kernel's device-resident epoch (= completed launches)."""

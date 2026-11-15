@@ -1,0 +1,48 @@
+"""Experimental (local only): kernel_sched + dynamic-EPLB closure of the SM120 Cake MegaMoE (merged seed
+param/pd-dyn: kernsched P1/P3/E3b on, MOE_DYN_EPLB), same Python boundary as ``cake_mxfp4_megamoe``."""
+
+from .shim import (
+    AOT_DEVICE_PARAMETERS,
+    DEVICE_PARAMETERS,
+    EXPECTED_NCCL_VERSION_INTEGER,
+    GIN_BACKENDS,
+    INSTANCE_NAMES,
+    cake_sm120_megamoe_available,
+    check_exact_sm120,
+    cuobjdump_path,
+    device_cubin,
+    device_cubin_resource_usage,
+    device_defines,
+    gen_cake_sm120_megamoe_aot_modules,
+    gen_cake_sm120_megamoe_kernel_module,
+    gen_cake_sm120_megamoe_module,
+    gin_backend_name,
+    load_cake_sm120_megamoe_module,
+    nccl_installation,
+    nvcc_version,
+    read_geometry,
+    read_manifest,
+)
+
+__all__ = [
+    "AOT_DEVICE_PARAMETERS",
+    "DEVICE_PARAMETERS",
+    "EXPECTED_NCCL_VERSION_INTEGER",
+    "GIN_BACKENDS",
+    "INSTANCE_NAMES",
+    "cake_sm120_megamoe_available",
+    "check_exact_sm120",
+    "cuobjdump_path",
+    "device_cubin",
+    "device_cubin_resource_usage",
+    "device_defines",
+    "gen_cake_sm120_megamoe_aot_modules",
+    "gen_cake_sm120_megamoe_kernel_module",
+    "gen_cake_sm120_megamoe_module",
+    "gin_backend_name",
+    "load_cake_sm120_megamoe_module",
+    "nccl_installation",
+    "nvcc_version",
+    "read_geometry",
+    "read_manifest",
+]

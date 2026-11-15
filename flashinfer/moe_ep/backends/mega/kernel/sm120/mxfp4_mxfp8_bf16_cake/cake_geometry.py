@@ -90,6 +90,14 @@ class KernelParams:
     # Activation codec: 0 MXFP8 (W4A8), 1 NVFP4 (W4A4: E2M1 + E4M3 per 16 values, both GEMMs FP4),
     # 2 MXFP4 (W4A4: E2M1 + UE8M0 per 32 values, both GEMMs FP4, the W4A8 weights unchanged).
     act_codec: int = 0
+    # Experimental: the device closure of ``kernel_src/sm120/cake_mxfp4_megamoe_ks`` (kernel scheduling;
+    # its parameter list appends MOE_DYN_EPLB).  ``dyn_eplb`` (1 = dynamic-EPLB build) needs it.
+    kernel_sched: bool = False
+    dyn_eplb: int = 0
+
+    def __post_init__(self) -> None:
+        if self.dyn_eplb and not self.kernel_sched:
+            raise GeometryError("dyn_eplb needs the kernel_sched closure (kernel_sched=True)")
 
     @property
     def local_experts(self) -> int:
@@ -114,7 +122,7 @@ class KernelParams:
             self.act_p1,
             self.return_codec,
             self.act_codec,
-        )
+        ) + ((self.dyn_eplb,) if self.kernel_sched else ())
 
     def env(self) -> dict[str, int]:
         return {
@@ -132,6 +140,7 @@ class KernelParams:
             "MOE_ACT_P1": self.act_p1,
             "MOE_RETURN_CODEC": self.return_codec,
             "MOE_ACT_CODEC": self.act_codec,
+            **({"MOE_DYN_EPLB": self.dyn_eplb} if self.kernel_sched else {}),
         }
 
 
@@ -266,11 +275,20 @@ def _from_json(data: dict[str, Any]) -> _Geometry:
     )
 
 
-@functools.cache
-def _geometry() -> _Geometry:
-    from ......kernel_src.sm120.cake_mxfp4_megamoe import read_geometry
+def kernel_package(kernel_sched: bool = False) -> Any:
+    """The device-closure package: ``cake_mxfp4_megamoe`` (default) or the experimental
+    ``cake_mxfp4_megamoe_ks`` (kernel scheduling + MOE_DYN_EPLB)."""
 
-    return _from_json(read_geometry())
+    if kernel_sched:
+        from ......kernel_src.sm120 import cake_mxfp4_megamoe_ks as package
+    else:
+        from ......kernel_src.sm120 import cake_mxfp4_megamoe as package
+    return package
+
+
+@functools.cache
+def _geometry(kernel_sched: bool = False) -> _Geometry:
+    return _from_json(kernel_package(kernel_sched).read_geometry())
 
 
 def _table(g: _Geometry, index: int) -> dict[str, Any]:
@@ -341,7 +359,7 @@ def resolve(
     device source checks with ``static_assert`` / ``#error``).
     """
 
-    g = _geometry() if geometry is None else geometry
+    g = _geometry(params.kernel_sched) if geometry is None else geometry
     check_supported_region(params)
     if params.max_rows > ACTIVE_ROWS_FIELD_MAX:
         raise GeometryError(

@@ -278,6 +278,12 @@ def _cases() -> list[Case]:
     return cases
 
 
+def kernel_sched() -> bool:
+    """``CAKE_SM120_KERNEL_SCHED=1``: run the suite on the experimental kernel_sched closure."""
+
+    return os.environ.get("CAKE_SM120_KERNEL_SCHED", "0") == "1"
+
+
 def table_spec() -> str:
     value = os.environ.get("CAKE_SM120_MEGAMOE_TABLE", "").strip()
     return value or "all_gin"
@@ -742,6 +748,7 @@ def make_layer(
                 return_codec=return_codec,
                 shared_expert="fp8_in_kernel" if variant == "fp8shared" else None,
                 transport_table=table,
+                kernel_sched=kernel_sched(),
             ),
             quantize_input=True,
             preprocess_weights=True,

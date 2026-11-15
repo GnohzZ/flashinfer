@@ -7,7 +7,7 @@ Launch on 4 or 8 sm_120 GPUs of one host (NCCL 2.30.7 with the Device API):
 
 ``CAKE_SM120_MXFP4A4_CASES`` selects ``shape:variant[:l<L>][:int8]`` cases (default
 :data:`DEFAULT_CASES`, shapes from the W4A8 test) and ``CAKE_SM120_MEGAMOE_TABLE`` the transport
-table.  The weights are those of the W4A8 test (random MXFP4 routed experts, FP8 e4m3 shared
+table; ``CAKE_SM120_KERNEL_SCHED=1`` runs the kernel_sched closure.  The weights are those of the W4A8 test (random MXFP4 routed experts, FP8 e4m3 shared
 expert: the two backends take the same weight pack), the activations Gaussian.  The pure-torch
 oracle follows the kernel's numerical boundary:
 
@@ -41,6 +41,7 @@ from .test_moe_ep_sm120_w4a8_cake_mega import (
     expert_partial,
     init_distributed,
     int8_return_roundtrip,
+    kernel_sched,
     local_weights,
     make_inputs,
     swiglu_kernel_boundary,
@@ -199,6 +200,7 @@ def make_layer(rank, world_size, weights, *, case: Case, shape):
                 return_codec=case.return_codec,
                 shared_expert="fp8_in_kernel" if case.variant == "fp8shared" else None,
                 transport_table=table_spec(),
+                kernel_sched=kernel_sched(),
             ),
             quantize_input=True,
             preprocess_weights=True,

@@ -140,6 +140,8 @@ def make_layer(
     codec_overflow_blocks: int = 16,
     activation_fields: dict[str, Any] | None = None,
     return_codec: str = "bf16",
+    kernel_sched: bool = False,
+    dynamic_eplb: bool = False,
     config_type: type | None = None,
 ) -> Any:
     """A :class:`~flashinfer.moe_ep.MoEEpLayer` on this backend (EP group = WORLD).
@@ -175,6 +177,8 @@ def make_layer(
                 codec_overflow_blocks=codec_overflow_blocks,
                 **(activation_fields or {}),
                 return_codec=return_codec,
+                kernel_sched=kernel_sched,
+                dynamic_eplb=dynamic_eplb,
                 shared_expert=SHARED_EXPERT_FP8_IN_KERNEL if shared else None,
                 transport_table=transport_table,
             ),
