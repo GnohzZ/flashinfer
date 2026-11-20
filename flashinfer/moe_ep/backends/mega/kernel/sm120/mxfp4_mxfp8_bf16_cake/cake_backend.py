@@ -146,6 +146,17 @@ _ROW_TILE_COST_RATIO: dict[tuple[int, int], float] = {
     (156, 1): math.inf,
     (156, 2): math.inf,
 }
+# The kernel_sched closure (other task order, return service) moves the crossover: forced-m64 / m128
+# sweeps on that build (EP4 and EP8, one or all ranks busy, 256..4096 rows per rank, V19 EPLB routing).
+# RTX PRO 5000 MXFP4: m64 wins up to 2048 rows per rank everywhere (m128 by <= 5 % beyond); NVFP4 is not
+# measured on this build and keeps the closure threshold.
+_ROW_TILE_COST_RATIO_KERNEL_SCHED: dict[tuple[int, int], float] = {
+    (110, 0): 1.50,
+    (110, 2): math.inf,
+    (156, 0): math.inf,
+    (156, 1): math.inf,
+    (156, 2): math.inf,
+}
 _ROW_SCHEDULE_ENV = "FLASHINFER_CAKE_ROW_SCHEDULE"
 
 
@@ -1403,7 +1414,11 @@ class Sm120Mxfp4Mxfp8CakeMegaKernelBackend(MegaKernelBackend):
             local_experts=int(kernel["local_experts"]),
             m64_max_rows=int(kernel["transport"]["m64_max_rows"]),
             row_schedule=_row_schedule_setting(self._kernel_config.row_schedule),
-            tile_cost_ratio=_ROW_TILE_COST_RATIO.get((sm_count, self.ACT_CODEC)),
+            tile_cost_ratio=(
+                _ROW_TILE_COST_RATIO_KERNEL_SCHED
+                if self._kernel_config.kernel_sched
+                else _ROW_TILE_COST_RATIO
+            ).get((sm_count, self.ACT_CODEC)),
             stats=torch.zeros(1 + E, dtype=torch.int32, device=device),
             gathered_stats=torch.zeros(
                 (world_size, 1 + E), dtype=torch.int32, device=device
